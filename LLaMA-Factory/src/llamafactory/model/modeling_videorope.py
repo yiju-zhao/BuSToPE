@@ -112,6 +112,28 @@ class Qwen2VLCausalLMOutputWithPast(ModelOutput):
 
 
 class Qwen2VLRotaryEmbedding(nn.Module):
+    """
+    Qwen2-VL Rotary Position Embedding with optional FoPE (Fourier Position Embedding) support.
+
+    This class implements multimodal 3D rotary position embeddings for video understanding,
+    with support for temporal, height, and width dimensions. When FoPE is enabled, learnable
+    Fourier transformations are applied to each dimension independently, allowing the model
+    to learn optimal frequency combinations.
+
+    FoPE Configuration (add these to your Qwen2VLConfig):
+        - fourier (bool): Enable/disable FoPE (default: False)
+        - fourier_dim (int): Dimension for Fourier transformation (default: 0, uses head_dim)
+        - fourier_init (str): Initialization method ["eye", "eye_xavier_norm", "xavier_norm"]
+        - fourier_init_norm_gain (float): Gain for Xavier normalization (default: 0.3)
+        - fourier_separate_basis (bool): Separate sin/cos coefficients (default: True)
+        - fourier_separate_head (bool): Per-head vs shared coefficients (default: True)
+        - fourier_learnable (bool): Make coefficients trainable (default: False)
+        - fourier_norm (bool): Normalize during transformation (default: False)
+        - fourier_ignore_zero (bool): Special zero frequency handling (default: True)
+
+    When fourier=False, this behaves as standard VideoRoPE (m_rope).
+    When fourier=True, FoPE is applied separately to temporal, height, and width dimensions.
+    """
     def __init__(
         self,
         dim=None,
@@ -156,6 +178,261 @@ class Qwen2VLRotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
+        # FoPE: Initialize Fourier Position Embedding parameters if enabled
+        self.fourier = getattr(config, 'fourier', False) if config is not None else False
+        if self.fourier:
+            self._init_fourier_coefficients(config, device)
+
+    def _init_fourier_coefficients(self, config, device):
+        """Initialize FoPE coefficients for 3D position embeddings (temporal, height, width)."""
+        # Get head dimension from config
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+
+        # Determine input dimension for FoPE
+        fourier_dim = getattr(config, 'fourier_dim', 0)
+        self.dim = fourier_dim if fourier_dim > 0 else self.head_dim
+
+        # Set up FoPE dimensions
+        fourier_ignore_zero = getattr(config, 'fourier_ignore_zero', True)
+        if fourier_ignore_zero:
+            self.input_dim = self.inv_freq.size(-1)
+            self.output_dim = min(self.input_dim, self.head_dim // 4)
+        else:
+            self.input_dim = self.dim // 2
+            self.output_dim = self.head_dim // 2
+
+        # Set up coefficient shapes
+        fourier_separate_head = getattr(config, 'fourier_separate_head', True)
+        if fourier_separate_head:
+            size = (config.num_attention_heads, self.input_dim, self.output_dim)
+            self.coef_shape = "hDd"
+        else:
+            size = (self.input_dim, self.output_dim)
+            self.coef_shape = "Dd"
+
+        # Initialize 3 sets of FoPE coefficients (for temporal, height, width dimensions)
+        fourier_separate_basis = getattr(config, 'fourier_separate_basis', True)
+        fourier_learnable = getattr(config, 'fourier_learnable', False)
+
+        if fourier_separate_basis:
+            # Separate coefficients for sin and cos, for each of 3 dimensions
+            self.sin_coef_t = nn.Parameter(
+                torch.randn(size=size, device=device, dtype=torch.float),
+                requires_grad=fourier_learnable
+            )
+            self.cos_coef_t = nn.Parameter(
+                torch.randn(size=size, device=device, dtype=torch.float),
+                requires_grad=fourier_learnable
+            )
+            self.sin_coef_h = nn.Parameter(
+                torch.randn(size=size, device=device, dtype=torch.float),
+                requires_grad=fourier_learnable
+            )
+            self.cos_coef_h = nn.Parameter(
+                torch.randn(size=size, device=device, dtype=torch.float),
+                requires_grad=fourier_learnable
+            )
+            self.sin_coef_w = nn.Parameter(
+                torch.randn(size=size, device=device, dtype=torch.float),
+                requires_grad=fourier_learnable
+            )
+            self.cos_coef_w = nn.Parameter(
+                torch.randn(size=size, device=device, dtype=torch.float),
+                requires_grad=fourier_learnable
+            )
+        else:
+            # Shared coefficients for sin and cos, for each of 3 dimensions
+            self.fourier_coef_t = nn.Parameter(
+                torch.randn(size=size, device=device, dtype=torch.float),
+                requires_grad=fourier_learnable
+            )
+            self.fourier_coef_h = nn.Parameter(
+                torch.randn(size=size, device=device, dtype=torch.float),
+                requires_grad=fourier_learnable
+            )
+            self.fourier_coef_w = nn.Parameter(
+                torch.randn(size=size, device=device, dtype=torch.float),
+                requires_grad=fourier_learnable
+            )
+
+        self.reset_parameters()
+
+    def get_step_eye(self, param):
+        """Generate step-wise identity matrix for dimension reduction."""
+        param_new = torch.zeros_like(param)
+        step = math.ceil(self.input_dim / self.output_dim)
+        for i in range(self.output_dim):
+            if i * step < self.input_dim:
+                param_new[..., i * step, i] = 1.0
+        return param_new
+
+    def reset_parameters(self):
+        """Reset FoPE coefficients with various initialization strategies."""
+        if not self.fourier:
+            return
+
+        fourier_init = getattr(self.config, 'fourier_init', 'eye_xavier_norm')
+        fourier_separate_basis = getattr(self.config, 'fourier_separate_basis', True)
+        fourier_separate_head = getattr(self.config, 'fourier_separate_head', True)
+        fourier_init_norm_gain = getattr(self.config, 'fourier_init_norm_gain', 0.3)
+
+        with torch.no_grad():
+            if fourier_separate_basis:
+                # Initialize all 3 dimension coefficient pairs
+                coef_pairs = [
+                    (self.sin_coef_t, self.cos_coef_t),
+                    (self.sin_coef_h, self.cos_coef_h),
+                    (self.sin_coef_w, self.cos_coef_w)
+                ]
+
+                for sin_coef, cos_coef in coef_pairs:
+                    if fourier_init == "eye":
+                        if self.input_dim == self.output_dim:
+                            if fourier_separate_head:
+                                for i in range(sin_coef.size(0)):
+                                    torch.nn.init.eye_(sin_coef[i])
+                                    torch.nn.init.eye_(cos_coef[i])
+                            else:
+                                torch.nn.init.eye_(sin_coef)
+                                torch.nn.init.eye_(cos_coef)
+                        else:
+                            sin_coef.data = self.get_step_eye(sin_coef)
+                            cos_coef.data = self.get_step_eye(cos_coef)
+
+                    elif fourier_init == "eye_xavier_norm":
+                        torch.nn.init.xavier_normal_(sin_coef, gain=fourier_init_norm_gain)
+                        torch.nn.init.xavier_normal_(cos_coef, gain=fourier_init_norm_gain)
+
+                        if self.input_dim == self.output_dim:
+                            if fourier_separate_head:
+                                for i in range(sin_coef.size(0)):
+                                    sin_coef[i] += torch.eye(self.input_dim, device=sin_coef.device)
+                                    cos_coef[i] += torch.eye(self.input_dim, device=cos_coef.device)
+                            else:
+                                sin_coef += torch.eye(self.input_dim, device=sin_coef.device)
+                                cos_coef += torch.eye(self.input_dim, device=cos_coef.device)
+                        else:
+                            sin_coef += self.get_step_eye(sin_coef)
+                            cos_coef += self.get_step_eye(cos_coef)
+
+                    elif fourier_init == "xavier_norm":
+                        torch.nn.init.xavier_normal_(sin_coef)
+                        torch.nn.init.xavier_normal_(cos_coef)
+                    else:
+                        raise ValueError(f"Unsupported init method: {fourier_init}")
+            else:
+                # Initialize all 3 dimension coefficients
+                fourier_coefs = [self.fourier_coef_t, self.fourier_coef_h, self.fourier_coef_w]
+
+                for fourier_coef in fourier_coefs:
+                    if fourier_init == "eye":
+                        if self.input_dim == self.output_dim:
+                            if fourier_separate_head:
+                                for i in range(fourier_coef.size(0)):
+                                    torch.nn.init.eye_(fourier_coef[i])
+                            else:
+                                torch.nn.init.eye_(fourier_coef)
+                        else:
+                            fourier_coef.data = self.get_step_eye(fourier_coef)
+
+                    elif fourier_init == "eye_xavier_norm":
+                        torch.nn.init.xavier_normal_(fourier_coef, gain=fourier_init_norm_gain)
+
+                        if self.input_dim == self.output_dim:
+                            if fourier_separate_head:
+                                for i in range(fourier_coef.size(0)):
+                                    fourier_coef[i] += torch.eye(self.input_dim, device=fourier_coef.device)
+                            else:
+                                fourier_coef += torch.eye(self.input_dim, device=fourier_coef.device)
+                        else:
+                            fourier_coef += self.get_step_eye(fourier_coef)
+
+                    elif fourier_init == "xavier_norm":
+                        torch.nn.init.xavier_normal_(fourier_coef)
+                    else:
+                        raise ValueError(f"Unsupported init method: {fourier_init}")
+
+    def apply_fourier_transform(self, pos_sin, pos_cos):
+        """
+        Apply Fourier transformation to RoPE frequencies for 3D positions.
+
+        Args:
+            pos_sin: Sin embeddings with shape [3, batch, seq, head_dim]
+            pos_cos: Cos embeddings with shape [3, batch, seq, head_dim]
+
+        Returns:
+            Transformed (fourier_sin, fourier_cos) with same shape [3, batch, seq, head_dim]
+        """
+        fourier_separate_basis = getattr(self.config, 'fourier_separate_basis', True)
+        fourier_norm = getattr(self.config, 'fourier_norm', False)
+        fourier_ignore_zero = getattr(self.config, 'fourier_ignore_zero', True)
+
+        # Determine einsum pattern based on input shape
+        # pos_sin/cos have shape [3, batch, seq, head_dim]
+        input_shape = "btD"
+        output_shape = "btd"
+
+        # Process each dimension (temporal, height, width) independently
+        fourier_sin_list = []
+        fourier_cos_list = []
+
+        for dim_idx in range(3):
+            # Get coefficients for this dimension
+            if fourier_separate_basis:
+                if dim_idx == 0:  # temporal
+                    sin_coef, cos_coef = self.sin_coef_t, self.cos_coef_t
+                elif dim_idx == 1:  # height
+                    sin_coef, cos_coef = self.sin_coef_h, self.cos_coef_h
+                else:  # width
+                    sin_coef, cos_coef = self.sin_coef_w, self.cos_coef_w
+
+                if fourier_norm:
+                    fourier_sin_d = torch.einsum(f"{input_shape}, {self.coef_shape} -> {output_shape}",
+                                               pos_sin[dim_idx], sin_coef / sin_coef.sum(dim=-2, keepdim=True))
+                    fourier_cos_d = torch.einsum(f"{input_shape}, {self.coef_shape} -> {output_shape}",
+                                               pos_cos[dim_idx], cos_coef / cos_coef.sum(dim=-2, keepdim=True))
+                else:
+                    fourier_sin_d = torch.einsum(f"{input_shape}, {self.coef_shape} -> {output_shape}",
+                                               pos_sin[dim_idx], sin_coef)
+                    fourier_cos_d = torch.einsum(f"{input_shape}, {self.coef_shape} -> {output_shape}",
+                                               pos_cos[dim_idx], cos_coef)
+            else:
+                if dim_idx == 0:  # temporal
+                    fourier_coef = self.fourier_coef_t
+                elif dim_idx == 1:  # height
+                    fourier_coef = self.fourier_coef_h
+                else:  # width
+                    fourier_coef = self.fourier_coef_w
+
+                if fourier_norm:
+                    fourier_sin_d = torch.einsum(f"{input_shape}, {self.coef_shape} -> {output_shape}",
+                                               pos_sin[dim_idx], fourier_coef / fourier_coef.sum(dim=-2, keepdim=True))
+                    fourier_cos_d = torch.einsum(f"{input_shape}, {self.coef_shape} -> {output_shape}",
+                                               pos_cos[dim_idx], fourier_coef / fourier_coef.sum(dim=-2, keepdim=True))
+                else:
+                    fourier_sin_d = torch.einsum(f"{input_shape}, {self.coef_shape} -> {output_shape}",
+                                               pos_sin[dim_idx], fourier_coef)
+                    fourier_cos_d = torch.einsum(f"{input_shape}, {self.coef_shape} -> {output_shape}",
+                                               pos_cos[dim_idx], fourier_coef)
+
+            # Apply padding if fourier_ignore_zero
+            if fourier_ignore_zero:
+                fourier_sin_d = F.pad(fourier_sin_d, (0, self.head_dim//2 - fourier_sin_d.size(-1)), mode="constant", value=0)
+                fourier_cos_d = F.pad(fourier_cos_d, (0, self.head_dim//2 - fourier_cos_d.size(-1)), mode="constant", value=1)
+
+            # Duplicate for complex representation
+            fourier_sin_d = torch.cat((fourier_sin_d, fourier_sin_d), dim=-1)
+            fourier_cos_d = torch.cat((fourier_cos_d, fourier_cos_d), dim=-1)
+
+            fourier_sin_list.append(fourier_sin_d)
+            fourier_cos_list.append(fourier_cos_d)
+
+        # Stack back to shape [3, batch, seq, head_dim]
+        fourier_sin = torch.stack(fourier_sin_list, dim=0)
+        fourier_cos = torch.stack(fourier_cos_list, dim=0)
+
+        return fourier_sin, fourier_cos
+
     def _dynamic_frequency_update(self, position_ids, device):
         """
         dynamic RoPE layers should recompute `inv_freq` in the following situations:
@@ -179,6 +456,11 @@ class Qwen2VLRotaryEmbedding(nn.Module):
         if "dynamic" in self.rope_type:
             self._dynamic_frequency_update(position_ids, device=x.device)
 
+        # Lazy initialization of FoPE coefficients if enabled dynamically
+        if self.fourier and not hasattr(self, 'sin_coef_t') and not hasattr(self, 'fourier_coef_t'):
+            rank0_print("Lazy initializing FoPE coefficients...")
+            self._init_fourier_coefficients(self.config, x.device)
+
         # Core RoPE block. In contrast to other models, Qwen2_VL has different position ids for thw grids
         # So we expand the inv_freq to shape (3, ...)
         inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
@@ -190,8 +472,15 @@ class Qwen2VLRotaryEmbedding(nn.Module):
         with torch.autocast(device_type=device_type, enabled=False):
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
             emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos()
-            sin = emb.sin()
+            pos_sin = emb.sin()
+            pos_cos = emb.cos()
+
+            # FoPE: Apply Fourier transformation if enabled
+            if self.fourier:
+                pos_cos, pos_sin = self.apply_fourier_transform(pos_sin, pos_cos)
+
+            cos = pos_cos
+            sin = pos_sin
 
         # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
         cos = cos * self.attention_scaling
@@ -2085,14 +2374,14 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
             # fix no 3d-rope position ids bug
-            
+
             # import pdb; pdb.set_trace()
             if position_ids is None and input_ids is not None:
-                # self.which_rope = 'm_modify_rope' # m_rope, tad_rope, vanilla_rope, videorope
+                # self.which_rope = 'm_modify_rope' # m_rope, tad_rope, vanilla_rope, videorope, fope
                 rank0_print(f"{self.which_rope=}")
                 #! apply apply_m_modify_multimodal_rotary_pos_emb when training
                 if 'videorope' in self.which_rope:
-                    
+
                     global apply_multimodal_rotary_pos_emb
                     apply_multimodal_rotary_pos_emb = apply_m_modify_multimodal_rotary_pos_emb
                 if self.which_rope == 'm_rope':
@@ -2115,6 +2404,13 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
                     position_ids = position_ids + position_ids_origin
                 elif self.which_rope == 'vanilla_rope':
                     position_ids, _ = self.get_vanilla_rope_index(
+                        input_ids, image_grid_thw, video_grid_thw, attention_mask
+                    )
+                elif self.which_rope == 'fope':
+                    # FoPE: 3D Fourier Position Embedding - uses m_rope position IDs with FoPE transformation
+                    if hasattr(self.model, 'rotary_emb'):
+                        self.model.rotary_emb.fourier = True
+                    position_ids, _ = self.get_rope_index(
                         input_ids, image_grid_thw, video_grid_thw, attention_mask
                     )
                 else:

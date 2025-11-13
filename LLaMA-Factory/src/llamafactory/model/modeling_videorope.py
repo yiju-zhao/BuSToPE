@@ -2517,6 +2517,13 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
                         input_ids, image_grid_thw, video_grid_thw, attention_mask
                     )
                     position_ids = position_ids + position_ids_origin
+                elif which_rope == 'fope':
+                    # FoPE: 3D Fourier Position Embedding - uses m_rope position IDs with FoPE transformation
+                    if hasattr(self.model, 'rotary_emb'):
+                        self.model.rotary_emb.fourier = True
+                    position_ids, rope_deltas = self.get_rope_index(
+                        input_ids, image_grid_thw, video_grid_thw, attention_mask
+                    )
                 else:
                     raise ValueError(f"have not this type of rope {which_rope}")
                 

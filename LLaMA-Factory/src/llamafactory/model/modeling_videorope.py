@@ -357,18 +357,21 @@ class Qwen2VLRotaryEmbedding(nn.Module):
         Apply Fourier transformation to RoPE frequencies for 3D positions.
 
         Args:
-            pos_sin: Sin embeddings with shape [3, batch, seq, head_dim]
-            pos_cos: Cos embeddings with shape [3, batch, seq, head_dim]
+            pos_sin: Sin embeddings with shape [3, batch, seq, dim//2] (un-concatenated freqs)
+            pos_cos: Cos embeddings with shape [3, batch, seq, dim//2] (un-concatenated freqs)
 
         Returns:
-            Transformed (fourier_sin, fourier_cos) with same shape [3, batch, seq, head_dim]
+            Transformed (fourier_sin, fourier_cos) with shape [3, batch, seq, head_dim]
+            Note: The output dimension is doubled from dim//2 to head_dim due to internal
+            padding (line 420-421) and concatenation (line 424-425) for complex representation.
         """
         fourier_separate_basis = getattr(self.config, 'fourier_separate_basis', True)
         fourier_norm = getattr(self.config, 'fourier_norm', False)
         fourier_ignore_zero = getattr(self.config, 'fourier_ignore_zero', True)
 
         # Determine einsum pattern based on input shape
-        # pos_sin/cos have shape [3, batch, seq, head_dim]
+        # pos_sin/cos have shape [3, batch, seq, dim//2] (un-concatenated freqs)
+        # After transformation, output will have shape [3, batch, seq, head_dim]
         input_shape = "btD"
         output_shape = "btd"
 
@@ -471,13 +474,22 @@ class Qwen2VLRotaryEmbedding(nn.Module):
         device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            pos_sin = emb.sin()
-            pos_cos = emb.cos()
 
             # FoPE: Apply Fourier transformation if enabled
+            # Note: For FoPE, we must apply sin/cos to un-concatenated freqs, then let
+            # apply_fourier_transform handle the concatenation internally (see lines 424-425)
             if self.fourier:
+                # freqs has shape [3, batch, seq, dim//2]
+                # Do NOT concatenate before passing to apply_fourier_transform
+                pos_sin = freqs.sin()  # shape: [3, batch, seq, dim//2]
+                pos_cos = freqs.cos()  # shape: [3, batch, seq, dim//2]
                 pos_cos, pos_sin = self.apply_fourier_transform(pos_sin, pos_cos)
+                # After transform, pos_sin/pos_cos have shape [3, batch, seq, head_dim]
+            else:
+                # Standard RoPE: concatenate freqs to create complex representation
+                emb = torch.cat((freqs, freqs), dim=-1)
+                pos_sin = emb.sin()
+                pos_cos = emb.cos()
 
             cos = pos_cos
             sin = pos_sin

@@ -442,6 +442,8 @@ class Qwen2VLRotaryEmbedding(nn.Module):
             # No chunking needed for non-per-head coefficients or single chunk
             if norm:
                 coef = coef / coef.sum(dim=-2, keepdim=True)
+            # Convert coef dtype to match input_tensor (critical for loaded checkpoints)
+            coef = coef.to(dtype=input_tensor.dtype)
             return torch.einsum(f"{input_shape}, {coef_shape} -> {output_shape}", input_tensor, coef)
         
         # Chunk processing for per-head coefficients
@@ -455,6 +457,9 @@ class Qwen2VLRotaryEmbedding(nn.Module):
             
             if norm:
                 coef_chunk = coef_chunk / coef_chunk.sum(dim=-2, keepdim=True)
+            
+            # Convert coef dtype to match input_tensor
+            coef_chunk = coef_chunk.to(dtype=input_tensor.dtype)
             
             # einsum: btD, HDd -> btHd (H is the chunk of heads)
             chunk_result = torch.einsum(f"{input_shape}, HDd -> btHd", input_tensor, coef_chunk)

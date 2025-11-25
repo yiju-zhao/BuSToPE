@@ -218,14 +218,15 @@ class Qwen2VLRotaryEmbedding(nn.Module):
         # FoPE: Initialize Fourier Position Embedding parameters if enabled
         self.fourier = FoPEConfig.fourier
         if self.fourier:
-            self._init_fourier_coefficients(config, device)
+            self._init_fourier_coefficients(config, device, dtype=None)
 
-    def _init_fourier_coefficients(self, config, device):
+    def _init_fourier_coefficients(self, config, device, dtype=None):
         """Initialize FoPE coefficients for 3D position embeddings (temporal, height, width).
         
         Args:
             config: Model configuration
             device: Target device. Can be None for CPU initialization (parameters will be moved later by DeepSpeed)
+            dtype: Target dtype for coefficients. If None, will try to use config.torch_dtype or default to float32
         """
         # Handle device=None case - initialize on CPU, will be moved to correct device later
         if device is None:
@@ -269,9 +270,11 @@ class Qwen2VLRotaryEmbedding(nn.Module):
         fourier_separate_basis = FoPEConfig.fourier_separate_basis
         fourier_learnable = FoPEConfig.fourier_learnable
         
-        # Determine dtype: use config's torch_dtype if available, otherwise use float32
+        # Determine dtype: prioritize passed dtype, then config's torch_dtype, then default to float32
         # This ensures FoPE coefficients match the model's dtype (e.g., bfloat16, float16, float32)
-        if hasattr(config, 'torch_dtype') and config.torch_dtype is not None:
+        if dtype is not None:
+            coef_dtype = dtype
+        elif hasattr(config, 'torch_dtype') and config.torch_dtype is not None:
             coef_dtype = config.torch_dtype
         else:
             coef_dtype = torch.float32
@@ -593,7 +596,8 @@ class Qwen2VLRotaryEmbedding(nn.Module):
                 # This can happen when loading from a pretrained model that doesn't have FoPE params
                 if not hasattr(self, 'sin_coef_t') and not hasattr(self, 'fourier_coef_t'):
                     rank0_print("[FoPE] Coefficients not found, initializing now...")
-                    self._init_fourier_coefficients(self.config, x.device)
+                    # Use x.dtype to ensure coefficients match input dtype (e.g., bfloat16)
+                    self._init_fourier_coefficients(self.config, x.device, dtype=x.dtype)
                 
                 # freqs has shape [3, batch, seq, dim//2]
                 # Do NOT concatenate before passing to apply_fourier_transform

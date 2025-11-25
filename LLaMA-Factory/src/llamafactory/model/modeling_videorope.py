@@ -72,6 +72,43 @@ def rank0_print(*args):
     else:
         print(*args)
 
+
+# ============================================================================
+# FoPE (Fourier Position Embedding) Configuration
+# ============================================================================
+# This configuration is separate from Qwen2VLConfig for simplicity.
+# Modify these values directly to control FoPE behavior and memory usage.
+# ============================================================================
+
+class FoPEConfig:
+    """
+    Configuration for Fourier Position Embedding (FoPE) in VideoRoPE.
+    
+    All FoPE settings are configured here. Simply modify the class attributes below.
+    
+    Memory Optimization Guidelines:
+    - For OOM issues, try: fourier_separate_head=False (reduces memory by ~28x)
+    - For peak memory reduction: fourier_chunk_size=4 (processes heads in chunks)
+    - For dimension reduction: fourier_dim=64 or 32
+    """
+    
+    # Core FoPE settings
+    fourier = False  # Set to True to enable FoPE
+    fourier_dim = 0  # 0 = use head_dim automatically
+    
+    # Memory optimization settings (IMPORTANT for avoiding OOM)
+    fourier_separate_head = False  # False = shared coefficients across heads (28x less memory!)
+    fourier_chunk_size = 1  # Set to 4+ to process heads in chunks (reduces peak memory)
+    
+    # Advanced settings
+    fourier_init = "eye_xavier_norm"  # Options: "eye", "eye_xavier_norm", "xavier_norm"
+    fourier_init_norm_gain = 0.3
+    fourier_separate_basis = True  # Separate sin/cos coefficients
+    fourier_learnable = False  # Make coefficients trainable
+    fourier_norm = False  # Normalize during transformation
+    fourier_ignore_zero = True  # Special zero frequency handling
+
+
 @dataclass
 class Qwen2VLCausalLMOutputWithPast(ModelOutput):
     """
@@ -179,7 +216,7 @@ class Qwen2VLRotaryEmbedding(nn.Module):
         self.original_inv_freq = self.inv_freq
 
         # FoPE: Initialize Fourier Position Embedding parameters if enabled
-        self.fourier = getattr(config, 'fourier', False) if config is not None else False
+        self.fourier = FoPEConfig.fourier
         if self.fourier:
             self._init_fourier_coefficients(config, device)
 
@@ -198,11 +235,11 @@ class Qwen2VLRotaryEmbedding(nn.Module):
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
 
         # Determine input dimension for FoPE
-        fourier_dim = getattr(config, 'fourier_dim', 0)
+        fourier_dim = FoPEConfig.fourier_dim
         self.dim = fourier_dim if fourier_dim > 0 else self.head_dim
 
         # Set up FoPE dimensions
-        fourier_ignore_zero = getattr(config, 'fourier_ignore_zero', True)
+        fourier_ignore_zero = FoPEConfig.fourier_ignore_zero
         if fourier_ignore_zero:
             self.input_dim = self.inv_freq.size(-1)
             self.output_dim = min(self.input_dim, self.head_dim // 4)
@@ -211,7 +248,7 @@ class Qwen2VLRotaryEmbedding(nn.Module):
             self.output_dim = self.head_dim // 2
 
         # Set up coefficient shapes
-        fourier_separate_head = getattr(config, 'fourier_separate_head', True)
+        fourier_separate_head = FoPEConfig.fourier_separate_head
         
         # Memory optimization: warn if using per-head coefficients with large models
         if fourier_separate_head and hasattr(config, 'num_attention_heads'):
@@ -229,8 +266,8 @@ class Qwen2VLRotaryEmbedding(nn.Module):
             self.coef_shape = "Dd"
 
         # Initialize 3 sets of FoPE coefficients (for temporal, height, width dimensions)
-        fourier_separate_basis = getattr(config, 'fourier_separate_basis', True)
-        fourier_learnable = getattr(config, 'fourier_learnable', False)
+        fourier_separate_basis = FoPEConfig.fourier_separate_basis
+        fourier_learnable = FoPEConfig.fourier_learnable
 
         if fourier_separate_basis:
             # Separate coefficients for sin and cos, for each of 3 dimensions
@@ -289,10 +326,10 @@ class Qwen2VLRotaryEmbedding(nn.Module):
         if not self.fourier:
             return
 
-        fourier_init = getattr(self.config, 'fourier_init', 'eye_xavier_norm')
-        fourier_separate_basis = getattr(self.config, 'fourier_separate_basis', True)
-        fourier_separate_head = getattr(self.config, 'fourier_separate_head', True)
-        fourier_init_norm_gain = getattr(self.config, 'fourier_init_norm_gain', 0.3)
+        fourier_init = FoPEConfig.fourier_init
+        fourier_separate_basis = FoPEConfig.fourier_separate_basis
+        fourier_separate_head = FoPEConfig.fourier_separate_head
+        fourier_init_norm_gain = FoPEConfig.fourier_init_norm_gain
 
         with torch.no_grad():
             if fourier_separate_basis:
@@ -430,15 +467,15 @@ class Qwen2VLRotaryEmbedding(nn.Module):
             Note: The output dimension is doubled from dim//2 to head_dim due to internal
             padding (line 420-421) and concatenation (line 424-425) for complex representation.
         """
-        fourier_separate_basis = getattr(self.config, 'fourier_separate_basis', True)
-        fourier_norm = getattr(self.config, 'fourier_norm', False)
-        fourier_ignore_zero = getattr(self.config, 'fourier_ignore_zero', True)
+        fourier_separate_basis = FoPEConfig.fourier_separate_basis
+        fourier_norm = FoPEConfig.fourier_norm
+        fourier_ignore_zero = FoPEConfig.fourier_ignore_zero
         
         # Memory optimization: use chunked processing if configured
         # fourier_chunk_size specifies how many chunks to split heads into
         # e.g., fourier_chunk_size=4 with 28 heads -> process 7 heads at a time
         # This reduces peak memory during backward pass from ~4.5GB to ~640MB per chunk
-        fourier_chunk_size = getattr(self.config, 'fourier_chunk_size', 1)  # 1 = no chunking
+        fourier_chunk_size = FoPEConfig.fourier_chunk_size
 
         # Determine einsum pattern based on input shape
         # pos_sin/cos have shape [3, batch, seq, dim//2] (un-concatenated freqs)

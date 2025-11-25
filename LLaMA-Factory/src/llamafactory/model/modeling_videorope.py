@@ -93,7 +93,7 @@ class FoPEConfig:
     """
     
     # Core FoPE settings
-    fourier = False  # Set to True to enable FoPE
+    fourier = True  # Set to True to enable FoPE
     fourier_dim = 0  # 0 = use head_dim automatically
     
     # Memory optimization settings (IMPORTANT for avoiding OOM)
@@ -589,6 +589,12 @@ class Qwen2VLRotaryEmbedding(nn.Module):
             # Note: For FoPE, we must apply sin/cos to un-concatenated freqs, then let
             # apply_fourier_transform handle the concatenation internally (see lines 424-425)
             if self.fourier:
+                # Safety check: initialize FoPE coefficients if not present
+                # This can happen when loading from a pretrained model that doesn't have FoPE params
+                if not hasattr(self, 'sin_coef_t') and not hasattr(self, 'fourier_coef_t'):
+                    rank0_print("[FoPE] Coefficients not found, initializing now...")
+                    self._init_fourier_coefficients(self.config, x.device)
+                
                 # freqs has shape [3, batch, seq, dim//2]
                 # Do NOT concatenate before passing to apply_fourier_transform
                 pos_sin = freqs.sin()  # shape: [3, batch, seq, dim//2]

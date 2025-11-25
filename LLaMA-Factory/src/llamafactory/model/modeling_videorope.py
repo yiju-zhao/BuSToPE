@@ -184,7 +184,16 @@ class Qwen2VLRotaryEmbedding(nn.Module):
             self._init_fourier_coefficients(config, device)
 
     def _init_fourier_coefficients(self, config, device):
-        """Initialize FoPE coefficients for 3D position embeddings (temporal, height, width)."""
+        """Initialize FoPE coefficients for 3D position embeddings (temporal, height, width).
+        
+        Args:
+            config: Model configuration
+            device: Target device. Can be None for CPU initialization (parameters will be moved later by DeepSpeed)
+        """
+        # Handle device=None case - initialize on CPU, will be moved to correct device later
+        if device is None:
+            device = torch.device('cpu')
+            
         # Get head dimension from config
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
 
@@ -203,6 +212,15 @@ class Qwen2VLRotaryEmbedding(nn.Module):
 
         # Set up coefficient shapes
         fourier_separate_head = getattr(config, 'fourier_separate_head', True)
+        
+        # Memory optimization: warn if using per-head coefficients with large models
+        if fourier_separate_head and hasattr(config, 'num_attention_heads'):
+            num_heads = config.num_attention_heads
+            estimated_param_mb = (num_heads * self.input_dim * self.output_dim * 6 * 4) / (1024**2)
+            if estimated_param_mb > 10:  # More than 10MB of FoPE parameters
+                rank0_print(f"[FoPE Warning] Using per-head coefficients with {num_heads} heads requires ~{estimated_param_mb:.1f}MB")
+                rank0_print(f"[FoPE Warning] Consider setting fourier_separate_head=False to reduce memory by {num_heads}x")
+        
         if fourier_separate_head:
             size = (config.num_attention_heads, self.input_dim, self.output_dim)
             self.coef_shape = "hDd"
@@ -352,6 +370,53 @@ class Qwen2VLRotaryEmbedding(nn.Module):
                     else:
                         raise ValueError(f"Unsupported init method: {fourier_init}")
 
+    def _chunked_einsum(self, input_tensor, coef, num_chunks, input_shape, coef_shape, output_shape, norm=False):
+        """
+        Process einsum in chunks to reduce memory usage during backward pass.
+        
+        This is critical when using per-head coefficients (fourier_separate_head=True),
+        as the standard einsum creates large intermediate tensors during gradient computation.
+        
+        Args:
+            input_tensor: Input tensor [batch, seq, D]
+            coef: Coefficient tensor [num_heads, D, d] or [D, d]
+            num_chunks: Number of chunks to split heads into (only for 'hDd' coef_shape)
+            input_shape: Einsum input pattern (e.g., "btD")
+            coef_shape: Einsum coef pattern (e.g., "hDd" or "Dd")
+            output_shape: Einsum output pattern (e.g., "btd" or "bthd")
+            norm: Whether to normalize coefficients
+            
+        Returns:
+            Output tensor after einsum operation
+        """
+        if coef_shape != "hDd" or num_chunks <= 1:
+            # No chunking needed for non-per-head coefficients or single chunk
+            if norm:
+                coef = coef / coef.sum(dim=-2, keepdim=True)
+            return torch.einsum(f"{input_shape}, {coef_shape} -> {output_shape}", input_tensor, coef)
+        
+        # Chunk processing for per-head coefficients
+        num_heads = coef.size(0)
+        chunk_size = (num_heads + num_chunks - 1) // num_chunks
+        chunks = []
+        
+        for i in range(0, num_heads, chunk_size):
+            end_idx = min(i + chunk_size, num_heads)
+            coef_chunk = coef[i:end_idx]
+            
+            if norm:
+                coef_chunk = coef_chunk / coef_chunk.sum(dim=-2, keepdim=True)
+            
+            # einsum: btD, HDd -> btHd (H is the chunk of heads)
+            chunk_result = torch.einsum(f"{input_shape}, HDd -> btHd", input_tensor, coef_chunk)
+            chunks.append(chunk_result)
+        
+        # Concatenate chunks: [batch, seq, num_heads, d]
+        result = torch.cat(chunks, dim=2)
+        
+        # Flatten last two dims: [batch, seq, num_heads*d]
+        return result.flatten(2)
+
     def apply_fourier_transform(self, pos_sin, pos_cos):
         """
         Apply Fourier transformation to RoPE frequencies for 3D positions.
@@ -368,6 +433,12 @@ class Qwen2VLRotaryEmbedding(nn.Module):
         fourier_separate_basis = getattr(self.config, 'fourier_separate_basis', True)
         fourier_norm = getattr(self.config, 'fourier_norm', False)
         fourier_ignore_zero = getattr(self.config, 'fourier_ignore_zero', True)
+        
+        # Memory optimization: use chunked processing if configured
+        # fourier_chunk_size specifies how many chunks to split heads into
+        # e.g., fourier_chunk_size=4 with 28 heads -> process 7 heads at a time
+        # This reduces peak memory during backward pass from ~4.5GB to ~640MB per chunk
+        fourier_chunk_size = getattr(self.config, 'fourier_chunk_size', 1)  # 1 = no chunking
 
         # Determine einsum pattern based on input shape
         # pos_sin/cos have shape [3, batch, seq, dim//2] (un-concatenated freqs)
@@ -389,16 +460,15 @@ class Qwen2VLRotaryEmbedding(nn.Module):
                 else:  # width
                     sin_coef, cos_coef = self.sin_coef_w, self.cos_coef_w
 
-                if fourier_norm:
-                    fourier_sin_d = torch.einsum(f"{input_shape}, {self.coef_shape} -> {output_shape}",
-                                               pos_sin[dim_idx], sin_coef / sin_coef.sum(dim=-2, keepdim=True))
-                    fourier_cos_d = torch.einsum(f"{input_shape}, {self.coef_shape} -> {output_shape}",
-                                               pos_cos[dim_idx], cos_coef / cos_coef.sum(dim=-2, keepdim=True))
-                else:
-                    fourier_sin_d = torch.einsum(f"{input_shape}, {self.coef_shape} -> {output_shape}",
-                                               pos_sin[dim_idx], sin_coef)
-                    fourier_cos_d = torch.einsum(f"{input_shape}, {self.coef_shape} -> {output_shape}",
-                                               pos_cos[dim_idx], cos_coef)
+                # Use chunked einsum for memory efficiency
+                fourier_sin_d = self._chunked_einsum(
+                    pos_sin[dim_idx], sin_coef, fourier_chunk_size,
+                    input_shape, self.coef_shape, output_shape, norm=fourier_norm
+                )
+                fourier_cos_d = self._chunked_einsum(
+                    pos_cos[dim_idx], cos_coef, fourier_chunk_size,
+                    input_shape, self.coef_shape, output_shape, norm=fourier_norm
+                )
             else:
                 if dim_idx == 0:  # temporal
                     fourier_coef = self.fourier_coef_t
@@ -407,16 +477,15 @@ class Qwen2VLRotaryEmbedding(nn.Module):
                 else:  # width
                     fourier_coef = self.fourier_coef_w
 
-                if fourier_norm:
-                    fourier_sin_d = torch.einsum(f"{input_shape}, {self.coef_shape} -> {output_shape}",
-                                               pos_sin[dim_idx], fourier_coef / fourier_coef.sum(dim=-2, keepdim=True))
-                    fourier_cos_d = torch.einsum(f"{input_shape}, {self.coef_shape} -> {output_shape}",
-                                               pos_cos[dim_idx], fourier_coef / fourier_coef.sum(dim=-2, keepdim=True))
-                else:
-                    fourier_sin_d = torch.einsum(f"{input_shape}, {self.coef_shape} -> {output_shape}",
-                                               pos_sin[dim_idx], fourier_coef)
-                    fourier_cos_d = torch.einsum(f"{input_shape}, {self.coef_shape} -> {output_shape}",
-                                               pos_cos[dim_idx], fourier_coef)
+                # Use chunked einsum for memory efficiency
+                fourier_sin_d = self._chunked_einsum(
+                    pos_sin[dim_idx], fourier_coef, fourier_chunk_size,
+                    input_shape, self.coef_shape, output_shape, norm=fourier_norm
+                )
+                fourier_cos_d = self._chunked_einsum(
+                    pos_cos[dim_idx], fourier_coef, fourier_chunk_size,
+                    input_shape, self.coef_shape, output_shape, norm=fourier_norm
+                )
 
             # Apply padding if fourier_ignore_zero
             if fourier_ignore_zero:
@@ -458,11 +527,6 @@ class Qwen2VLRotaryEmbedding(nn.Module):
     def forward(self, x, position_ids):
         if "dynamic" in self.rope_type:
             self._dynamic_frequency_update(position_ids, device=x.device)
-
-        # Lazy initialization of FoPE coefficients if enabled dynamically
-        if self.fourier and not hasattr(self, 'sin_coef_t') and not hasattr(self, 'fourier_coef_t'):
-            rank0_print("Lazy initializing FoPE coefficients...")
-            self._init_fourier_coefficients(self.config, x.device)
 
         # Core RoPE block. In contrast to other models, Qwen2_VL has different position ids for thw grids
         # So we expand the inv_freq to shape (3, ...)

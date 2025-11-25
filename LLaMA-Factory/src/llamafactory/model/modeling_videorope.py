@@ -268,45 +268,54 @@ class Qwen2VLRotaryEmbedding(nn.Module):
         # Initialize 3 sets of FoPE coefficients (for temporal, height, width dimensions)
         fourier_separate_basis = FoPEConfig.fourier_separate_basis
         fourier_learnable = FoPEConfig.fourier_learnable
+        
+        # Determine dtype: use config's torch_dtype if available, otherwise use float32
+        # This ensures FoPE coefficients match the model's dtype (e.g., bfloat16, float16, float32)
+        if hasattr(config, 'torch_dtype') and config.torch_dtype is not None:
+            coef_dtype = config.torch_dtype
+        else:
+            coef_dtype = torch.float32
+        
+        rank0_print(f"[FoPE] Initializing coefficients with dtype={coef_dtype}")
 
         if fourier_separate_basis:
             # Separate coefficients for sin and cos, for each of 3 dimensions
             self.sin_coef_t = nn.Parameter(
-                torch.randn(size=size, device=device, dtype=torch.float),
+                torch.randn(size=size, device=device, dtype=coef_dtype),
                 requires_grad=fourier_learnable
             )
             self.cos_coef_t = nn.Parameter(
-                torch.randn(size=size, device=device, dtype=torch.float),
+                torch.randn(size=size, device=device, dtype=coef_dtype),
                 requires_grad=fourier_learnable
             )
             self.sin_coef_h = nn.Parameter(
-                torch.randn(size=size, device=device, dtype=torch.float),
+                torch.randn(size=size, device=device, dtype=coef_dtype),
                 requires_grad=fourier_learnable
             )
             self.cos_coef_h = nn.Parameter(
-                torch.randn(size=size, device=device, dtype=torch.float),
+                torch.randn(size=size, device=device, dtype=coef_dtype),
                 requires_grad=fourier_learnable
             )
             self.sin_coef_w = nn.Parameter(
-                torch.randn(size=size, device=device, dtype=torch.float),
+                torch.randn(size=size, device=device, dtype=coef_dtype),
                 requires_grad=fourier_learnable
             )
             self.cos_coef_w = nn.Parameter(
-                torch.randn(size=size, device=device, dtype=torch.float),
+                torch.randn(size=size, device=device, dtype=coef_dtype),
                 requires_grad=fourier_learnable
             )
         else:
             # Shared coefficients for sin and cos, for each of 3 dimensions
             self.fourier_coef_t = nn.Parameter(
-                torch.randn(size=size, device=device, dtype=torch.float),
+                torch.randn(size=size, device=device, dtype=coef_dtype),
                 requires_grad=fourier_learnable
             )
             self.fourier_coef_h = nn.Parameter(
-                torch.randn(size=size, device=device, dtype=torch.float),
+                torch.randn(size=size, device=device, dtype=coef_dtype),
                 requires_grad=fourier_learnable
             )
             self.fourier_coef_w = nn.Parameter(
-                torch.randn(size=size, device=device, dtype=torch.float),
+                torch.randn(size=size, device=device, dtype=coef_dtype),
                 requires_grad=fourier_learnable
             )
 
